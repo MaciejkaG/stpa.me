@@ -62,5 +62,8 @@ USER stpame
 # Expose the port the app runs on (default 3000)
 EXPOSE 3000
 
+# Set environment variables for better error reporting
+ENV RUST_BACKTRACE=1
+
 # Run the binary
 CMD ["./stpa-me"]

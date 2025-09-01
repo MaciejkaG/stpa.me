@@ -67,7 +67,18 @@ async fn main() -> anyhow::Result<()> {
     info!("Bind address: {}", bind_address);
 
     // Connect to database
-    let pool = PgPool::connect(&database_url).await?;
+    info!("Attempting to connect to database...");
+    let pool = match PgPool::connect(&database_url).await {
+        Ok(pool) => {
+            info!("Successfully connected to database");
+            pool
+        }
+        Err(e) => {
+            warn!("Failed to connect to database: {}", e);
+            warn!("Make sure PostgreSQL is running and accessible at: {}", database_url);
+            return Err(e.into());
+        }
+    };
 
     let state = AppState {
         db: pool,
