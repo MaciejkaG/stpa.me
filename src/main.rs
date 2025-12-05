@@ -19,23 +19,26 @@
 use axum::{
     Router,
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::{IntoResponse, Redirect},
     routing::get,
 };
+use moka::future::Cache;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
-use std::{collections::HashMap, env, fs::File, path::Path as StdPath};
+use std::{collections::HashMap, env, fs::File, path::Path as StdPath, sync::Arc, time::Duration};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::{info, warn};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct AppState {
     db: PgPool,
     default_redirect: String,
+    csv_links: Arc<HashMap<String, String>>,
+    link_cache: Cache<String, ShortLink>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ShortLink {
     id: uuid::Uuid,
     token: String,
@@ -80,9 +83,21 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Load CSV links at startup
+    let csv_links = Arc::new(read_csv_links());
+    info!("Loaded {} links from CSV file into memory", csv_links.len());
+
+    // Create a cache for database lookups with 5 minute TTL and max 10000 entries
+    let link_cache: Cache<String, ShortLink> = Cache::builder()
+        .max_capacity(10_000)
+        .time_to_live(Duration::from_secs(300))
+        .build();
+
     let state = AppState {
         db: pool,
         default_redirect,
+        csv_links,
+        link_cache,
     };
 
     // Build router
@@ -111,8 +126,28 @@ async fn handle_redirect(
     Path(token): Path<String>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    match get_short_link(&state.db, &token).await {
+    // First, check the in-memory cache
+    if let Some(link) = state.link_cache.get(&token).await {
+        // Increment click count asynchronously (fire and forget) only for DB entries
+        let db_clone = state.db.clone();
+        let token_clone = token.clone();
+        tokio::spawn(async move {
+            if let Err(e) = increment_click_count(&db_clone, &token_clone).await {
+                warn!("Failed to increment click count for {}: {}", token_clone, e);
+            }
+        });
+
+        info!("Cache hit: Redirecting {} to {}", token, link.long_url);
+        return Redirect::permanent(&link.long_url).into_response();
+    }
+
+    match get_short_link(&state.db, &token, &state.csv_links).await {
         Ok(Some(link)) => {
+            let long_url = link.long_url.clone();
+            
+            // Store in cache for future requests
+            state.link_cache.insert(token.clone(), link).await;
+
             // Increment click count asynchronously (fire and forget)
             let db_clone = state.db.clone();
             let token_clone = token.clone();
@@ -122,8 +157,8 @@ async fn handle_redirect(
                 }
             });
 
-            info!("Redirecting {} to {}", token, link.long_url);
-            Redirect::permanent(&link.long_url).into_response()
+            info!("Cache miss: Redirecting {} to {}", token, long_url);
+            Redirect::permanent(&long_url).into_response()
         }
         Ok(None) => {
             warn!("Token not found: {}", token);
@@ -183,7 +218,7 @@ fn read_csv_links() -> HashMap<String, String> {
     }
 }
 
-async fn get_short_link(pool: &PgPool, token: &str) -> anyhow::Result<Option<ShortLink>> {
+async fn get_short_link(pool: &PgPool, token: &str, csv_links: &HashMap<String, String>) -> anyhow::Result<Option<ShortLink>> {
     // First, try to get the link from the database
     let row = sqlx::query(
         "SELECT id, token, long_url, created_at, click_count, is_active 
@@ -204,9 +239,7 @@ async fn get_short_link(pool: &PgPool, token: &str) -> anyhow::Result<Option<Sho
             is_active: row.get("is_active"),
         })),
         None => {
-            // If not found in database, check CSV file
-            let csv_links = read_csv_links();
-            
+            // If not found in database, check pre-loaded CSV links
             if let Some(long_url) = csv_links.get(token) {
                 info!("Found token {} in CSV file, redirecting to {}", token, long_url);
                 
