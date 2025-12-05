@@ -46,6 +46,15 @@ struct ShortLink {
     created_at: chrono::DateTime<chrono::Utc>,
     click_count: i64,
     is_active: bool,
+    #[serde(default)]
+    source: LinkSource,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+enum LinkSource {
+    #[default]
+    Database,
+    Csv,
 }
 
 #[tokio::main]
@@ -128,14 +137,16 @@ async fn handle_redirect(
 ) -> impl IntoResponse {
     // First, check the in-memory cache
     if let Some(link) = state.link_cache.get(&token).await {
-        // Increment click count asynchronously (fire and forget) only for DB entries
-        let db_clone = state.db.clone();
-        let token_clone = token.clone();
-        tokio::spawn(async move {
-            if let Err(e) = increment_click_count(&db_clone, &token_clone).await {
-                warn!("Failed to increment click count for {}: {}", token_clone, e);
-            }
-        });
+        // Increment click count asynchronously only for database entries
+        if link.source == LinkSource::Database {
+            let db_clone = state.db.clone();
+            let token_clone = token.clone();
+            tokio::spawn(async move {
+                if let Err(e) = increment_click_count(&db_clone, &token_clone).await {
+                    warn!("Failed to increment click count for {}: {}", token_clone, e);
+                }
+            });
+        }
 
         info!("Cache hit: Redirecting {} to {}", token, link.long_url);
         return Redirect::permanent(&link.long_url).into_response();
@@ -144,18 +155,21 @@ async fn handle_redirect(
     match get_short_link(&state.db, &token, &state.csv_links).await {
         Ok(Some(link)) => {
             let long_url = link.long_url.clone();
+            let source = link.source;
             
             // Store in cache for future requests
             state.link_cache.insert(token.clone(), link).await;
 
-            // Increment click count asynchronously (fire and forget)
-            let db_clone = state.db.clone();
-            let token_clone = token.clone();
-            tokio::spawn(async move {
-                if let Err(e) = increment_click_count(&db_clone, &token_clone).await {
-                    warn!("Failed to increment click count for {}: {}", token_clone, e);
-                }
-            });
+            // Increment click count asynchronously only for database entries
+            if source == LinkSource::Database {
+                let db_clone = state.db.clone();
+                let token_clone = token.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = increment_click_count(&db_clone, &token_clone).await {
+                        warn!("Failed to increment click count for {}: {}", token_clone, e);
+                    }
+                });
+            }
 
             info!("Cache miss: Redirecting {} to {}", token, long_url);
             Redirect::permanent(&long_url).into_response()
@@ -237,21 +251,23 @@ async fn get_short_link(pool: &PgPool, token: &str, csv_links: &HashMap<String, 
             created_at: row.get("created_at"),
             click_count: row.get("click_count"),
             is_active: row.get("is_active"),
+            source: LinkSource::Database,
         })),
         None => {
             // If not found in database, check pre-loaded CSV links
             if let Some(long_url) = csv_links.get(token) {
-                info!("Found token {} in CSV file, redirecting to {}", token, long_url);
+                info!("Found token {} in CSV links, redirecting to {}", token, long_url);
                 
                 // Create a ShortLink struct for CSV entries
-                // Using default/placeholder values for database-specific fields
+                // Note: id, created_at are placeholders since CSV entries don't have database records
                 Ok(Some(ShortLink {
-                    id: uuid::Uuid::new_v4(), // Generate a random UUID for CSV entries
+                    id: uuid::Uuid::nil(), // Use nil UUID to indicate this is not a real DB entry
                     token: token.to_string(),
                     long_url: long_url.clone(),
-                    created_at: chrono::Utc::now(), // Use current time as placeholder
+                    created_at: chrono::DateTime::UNIX_EPOCH, // Placeholder timestamp
                     click_count: 0, // CSV entries don't track clicks
-                    is_active: true, // Assume CSV entries are active
+                    is_active: true,
+                    source: LinkSource::Csv,
                 }))
             } else {
                 Ok(None)
