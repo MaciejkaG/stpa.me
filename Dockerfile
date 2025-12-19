@@ -47,9 +47,6 @@ WORKDIR /app
 # Copy the binary from the builder stage
 COPY --from=builder /app/target/release/stpa-me ./stpa-me
 
-# Copy database schema if it exists
-COPY database.sql ./database.sql
-
 # Create directory for optional CSV file
 RUN mkdir -p /app/data
 
